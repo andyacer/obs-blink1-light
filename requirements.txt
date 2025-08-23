@@ -1,0 +1,8 @@
+blink1==0.4.0
+click==8.2.1
+colorama==0.4.6
+hidapi==0.14.0.post4
+obs-websocket-py==1.0
+setuptools==80.9.0
+webcolors==24.11.1
+websocket-client==1.8.0
