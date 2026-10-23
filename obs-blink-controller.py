@@ -6,6 +6,7 @@ This script monitors OBS Studio's recording status and changes a Blink(1) light:
 - Red when recording
 - Green when not recording
 - Also allows toggling recording with a configurable keyboard shortcut
+- Flashes the light after a button press until OBS confirms the state change
 
 Requirements:
 - pip install obs-websocket-py blink1 pynput
@@ -33,12 +34,34 @@ OBS_PASSWORD = "OJtycF114KSw0nDs"  # Set your OBS WebSocket password here if you
 RECORDING_TOGGLE_KEY = Key.f14
 
 # Colors (RGB values 0-255)
-COLOR_RECORDING = (90, 0, 0)    # Red
+COLOR_OFF = (0, 0, 0)             # Light off
+COLOR_RECORDING = (90, 0, 0)      # Red
 COLOR_NOT_RECORDING = (0, 70, 0)  # Green
 COLOR_DISCONNECTED = (70, 70, 0)  # Yellow (when OBS is disconnected)
 
 # Fade delay in milliseconds
 FADE_TIME = 10
+
+# --- "State change in progress" flash feedback ---
+# After a toggle key press, the light alternates between the color it was
+# showing and the flash color below until OBS reports the new state.
+# FLASH_COLOR can be any RGB tuple, or COLOR_OFF to blink the light off.
+FLASH_COLOR = COLOR_OFF
+
+# Time (seconds) each half of the flash lasts (flash color, then original color).
+# Smaller = faster flashing. 0.08 is a rapid flutter, 0.25 is a calm blink.
+FLASH_INTERVAL = 0.1
+
+# Which transitions flash
+FLASH_ON_STOP = True    # Pressed while recording (saving the file takes time)
+FLASH_ON_START = False  # Pressed while not recording
+
+# Safety net: stop flashing after this many seconds even if OBS never confirms
+FLASH_TIMEOUT = 30
+
+# How often (seconds) to poll OBS: normally, and while waiting for confirmation
+POLL_INTERVAL = 1.0
+POLL_INTERVAL_FAST = 0.2
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -52,6 +75,13 @@ class OBSBlink1Controller:
         self.is_recording = False
         self.keyboard_listener = None
         self.running = True
+
+        # Flash state
+        self.flashing = False
+        self.pending_target = None   # True = waiting for recording to start, False = to stop
+        self.flash_stop = None       # threading.Event for the active flash thread
+        self.flash_thread = None
+        self.state_lock = threading.Lock()
         
     def setup_blink1(self):
         """Initialize Blink(1) device"""
@@ -129,6 +159,11 @@ class OBSBlink1Controller:
         if not self.ws:
             logger.error("Cannot toggle recording - not connected to OBS")
             return
+
+        # Ignore presses while a previous change is still in progress
+        if self.pending_target is not None:
+            logger.info("State change already in progress - ignoring key press")
+            return
         
         # Get current recording status to ensure we're in sync
         current_status = self.get_recording_status()
@@ -138,21 +173,88 @@ class OBSBlink1Controller:
         
         if current_status:
             logger.info("Currently recording - stopping recording")
-            self.stop_recording()
+            if FLASH_ON_STOP:
+                self.start_flash(target_recording=False)
+            if not self.stop_recording():
+                self.end_flash()
         else:
             logger.info("Currently not recording - starting recording")
-            self.start_recording()
-    
+            if FLASH_ON_START:
+                self.start_flash(target_recording=True)
+            if not self.start_recording():
+                self.end_flash()
+
+    # ------------------------------------------------------------------
+    # Light control
+    # ------------------------------------------------------------------
+    def _write_light(self, color):
+        """Write a color to the device unconditionally"""
+        if not self.blink1:
+            return
+        try:
+            r, g, b = color
+            self.blink1.fade_to_rgb(FADE_TIME, r, g, b)  # First argument is fade time
+            self.current_color = color
+        except Exception as e:
+            logger.error(f"Failed to set light color: {e}")
+
     def set_light_color(self, color):
-        """Set Blink(1) light color"""
+        """Set Blink(1) light color (suppressed while the flash thread owns the light)"""
+        if self.flashing:
+            return
         if self.blink1 and color != self.current_color:
-            try:
-                r, g, b = color
-                self.blink1.fade_to_rgb(FADE_TIME, r, g, b)  # First argument is fade time
-                self.current_color = color
-                logger.info(f"Light color changed to RGB{color}")
-            except Exception as e:
-                logger.error(f"Failed to set light color: {e}")
+            self._write_light(color)
+            logger.info(f"Light color changed to RGB{color}")
+
+    # ------------------------------------------------------------------
+    # Flash feedback
+    # ------------------------------------------------------------------
+    def start_flash(self, target_recording):
+        """Begin flashing to show a state change is in progress"""
+        with self.state_lock:
+            if self.flashing:
+                return
+            base_color = self.current_color if self.current_color is not None else (
+                COLOR_RECORDING if self.is_recording else COLOR_NOT_RECORDING
+            )
+            self.pending_target = target_recording
+            self.flash_stop = threading.Event()
+            self.flashing = True
+            self.flash_thread = threading.Thread(
+                target=self._flash_worker,
+                args=(base_color, self.flash_stop),
+                daemon=True,
+            )
+            self.flash_thread.start()
+        logger.info("State change in progress - flashing light")
+
+    def end_flash(self):
+        """Stop flashing (state change confirmed, failed, or timed out)"""
+        self.pending_target = None
+        if self.flash_stop:
+            self.flash_stop.set()
+
+    def _flash_worker(self, base_color, stop_event):
+        """Alternate between FLASH_COLOR and the original color until stopped"""
+        deadline = time.time() + FLASH_TIMEOUT
+        show_flash = True
+        while not stop_event.is_set() and time.time() < deadline:
+            self._write_light(FLASH_COLOR if show_flash else base_color)
+            show_flash = not show_flash
+            stop_event.wait(FLASH_INTERVAL)
+
+        if not stop_event.is_set():
+            logger.warning(f"No state change confirmed after {FLASH_TIMEOUT}s - giving up on flashing")
+            self.pending_target = None
+
+        # Hand the light back and show the color for the current state
+        self.flashing = False
+        if self.ws:
+            final = COLOR_RECORDING if self.is_recording else COLOR_NOT_RECORDING
+        else:
+            final = COLOR_DISCONNECTED
+        self._write_light(final)
+        logger.info(f"Flashing finished - light set to RGB{final}")
     
     def get_recording_status(self):
         """Get current recording status from OBS"""
@@ -173,6 +275,11 @@ class OBSBlink1Controller:
             else:
                 logger.info("Recording stopped - setting light to GREEN")
                 self.set_light_color(COLOR_NOT_RECORDING)
+
+        # OBS confirmed the state we were waiting for - stop flashing
+        if self.pending_target is not None and is_recording == self.pending_target:
+            logger.info("OBS confirmed state change")
+            self.end_flash()
     
     def monitor_loop(self):
         """Main monitoring loop"""
@@ -197,12 +304,14 @@ class OBSBlink1Controller:
                     # Connection issue
                     logger.warning("Lost connection to OBS")
                     self.ws = None
+                    self.end_flash()
                     self.set_light_color(COLOR_DISCONNECTED)
                 else:
                     # Update light based on status
                     self.handle_recording_status(recording_status)
                 
-                time.sleep(1)  # Check every second
+                # Poll faster while waiting for a state change to be confirmed
+                time.sleep(POLL_INTERVAL_FAST if self.pending_target is not None else POLL_INTERVAL)
                 
             except KeyboardInterrupt:
                 logger.info("Shutting down...")
@@ -215,6 +324,9 @@ class OBSBlink1Controller:
         """Clean up connections"""
         try:
             self.running = False
+            self.end_flash()
+            if self.flash_thread:
+                self.flash_thread.join(timeout=1)
             
             if self.keyboard_listener:
                 self.keyboard_listener.stop()
