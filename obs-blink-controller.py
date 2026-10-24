@@ -15,6 +15,7 @@ Requirements:
 """
 
 import time
+import queue
 import logging
 import threading
 from obswebsocket import obsws, requests
@@ -56,8 +57,10 @@ FLASH_INTERVAL = 0.1
 FLASH_ON_STOP = True    # Pressed while recording (saving the file takes time)
 FLASH_ON_START = False  # Pressed while not recording
 
-# Safety net: stop flashing after this many seconds even if OBS never confirms
-FLASH_TIMEOUT = 30
+# Safety net: stop flashing after this many seconds even if OBS never confirms.
+# Flashing normally lasts until OBS reports the recording has been saved, so
+# make this longer than your longest expected save.
+FLASH_TIMEOUT = 120
 
 # How often (seconds) to poll OBS: normally, and while waiting for confirmation
 POLL_INTERVAL = 1.0
@@ -82,6 +85,14 @@ class OBSBlink1Controller:
         self.flash_stop = None       # threading.Event for the active flash thread
         self.flash_thread = None
         self.state_lock = threading.Lock()
+
+        # Key presses are queued and handled one at a time by a worker thread.
+        # The worker waits for any flash (i.e. a save in progress) to finish
+        # before acting on the next press.
+        self.key_queue = queue.Queue()
+        self.idle = threading.Event()   # set when no flash/state change is in progress
+        self.idle.set()
+        self.key_worker = None
         
     def setup_blink1(self):
         """Initialize Blink(1) device"""
@@ -107,6 +118,8 @@ class OBSBlink1Controller:
     def setup_keyboard_listener(self):
         """Setup global keyboard listener for recording toggle"""
         try:
+            self.key_worker = threading.Thread(target=self._key_worker_loop, daemon=True)
+            self.key_worker.start()
             self.keyboard_listener = keyboard.Listener(
                 on_press=self.on_key_press
             )
@@ -118,13 +131,31 @@ class OBSBlink1Controller:
             return False
     
     def on_key_press(self, key):
-        """Handle key press events"""
+        """Handle key press events (just queues the press; never blocks)"""
         try:
             if key == RECORDING_TOGGLE_KEY:
                 logger.info(f"Recording toggle key ({RECORDING_TOGGLE_KEY}) pressed")
-                self.toggle_recording()
+                self.key_queue.put(time.time())
         except Exception as e:
             logger.error(f"Error handling key press: {e}")
+
+    def _key_worker_loop(self):
+        """Process queued key presses in order, one at a time"""
+        while self.running:
+            try:
+                pressed_at = self.key_queue.get()
+                if pressed_at is None:  # shutdown sentinel
+                    break
+                if not self.idle.is_set():
+                    logger.info("Save in progress - key press queued until it finishes")
+                # Wait for any in-progress flash (save) to finish before acting
+                while self.running and not self.idle.wait(timeout=0.5):
+                    pass
+                if not self.running:
+                    break
+                self.toggle_recording()
+            except Exception as e:
+                logger.error(f"Error processing key press: {e}")
     
     def start_recording(self):
         """Start recording in OBS"""
@@ -160,11 +191,6 @@ class OBSBlink1Controller:
             logger.error("Cannot toggle recording - not connected to OBS")
             return
 
-        # Ignore presses while a previous change is still in progress
-        if self.pending_target is not None:
-            logger.info("State change already in progress - ignoring key press")
-            return
-        
         # Get current recording status to ensure we're in sync
         current_status = self.get_recording_status()
         if current_status is None:
@@ -220,6 +246,7 @@ class OBSBlink1Controller:
             self.pending_target = target_recording
             self.flash_stop = threading.Event()
             self.flashing = True
+            self.idle.clear()
             self.flash_thread = threading.Thread(
                 target=self._flash_worker,
                 args=(base_color, self.flash_stop),
@@ -255,6 +282,7 @@ class OBSBlink1Controller:
             final = COLOR_DISCONNECTED
         self._write_light(final)
         logger.info(f"Flashing finished - light set to RGB{final}")
+        self.idle.set()  # queued key presses may now be processed
     
     def get_recording_status(self):
         """Get current recording status from OBS"""
@@ -324,6 +352,7 @@ class OBSBlink1Controller:
         """Clean up connections"""
         try:
             self.running = False
+            self.key_queue.put(None)  # wake the key worker so it can exit
             self.end_flash()
             if self.flash_thread:
                 self.flash_thread.join(timeout=1)
